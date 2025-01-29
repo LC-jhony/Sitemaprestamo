@@ -5,15 +5,17 @@ namespace App\Filament\Resources;
 use App\Filament\Resources\LoanResource\Pages;
 use App\Filament\Resources\LoanResource\RelationManagers;
 use App\Models\Loan;
+use Awcodes\TableRepeater\Components\TableRepeater;
+use Awcodes\TableRepeater\Header;
+use Closure;
 use Filament\Forms;
 use Filament\Forms\Form;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
-use Awcodes\TableRepeater\Components\TableRepeater;
-use Awcodes\TableRepeater\Header;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
+use Pelmered\FilamentMoneyField\Forms\Components\MoneyInput;
 
 class LoanResource extends Resource
 {
@@ -35,19 +37,21 @@ class LoanResource extends Resource
                             ->native(false),
                         Forms\Components\TextInput::make('amount')
                             ->required()
+                            ->default(5000)
                             ->numeric(),
                         Forms\Components\Select::make('rate_id')
-                            ->relationship('rate', 'percent')
+                            ->relationship('rate', 'percent', fn(Builder $query) => $query
+                                ->selectRaw('*, FORMAT(percent, 0) as percent'))
                             ->searchable()
                             ->preload()
                             ->required()
                             ->native(false),
                         Forms\Components\TextInput::make('years')
-                            ->nullable()
+                            ->default(1)
                             ->numeric()
                             ->extraInputAttributes(['width' => 10]),
                         Forms\Components\Select::make('frecuency_id')
-                            ->relationship('frecuency', 'name')
+                            ->relationship('frecuency', 'days')
                             ->searchable()
                             ->preload()
                             ->required()
@@ -59,18 +63,7 @@ class LoanResource extends Resource
                                 'american' => 'American (Interest Only)'
                             ])
                             ->required()
-                            ->reactive()
-                            ->reactive()
-                            ->afterStateUpdated(function (callable $set, $state, Forms\Get $get) {
-                                if ($state === 'french') {
-                                    $amount = $get('amount');
-                                    $rate = $get('rate_id') / 100;
-                                    $years = $get('years');
-                                    $frequency = $get('frecuency_id');
-
-                                    $set('payments', self::calculateFrenchAmortization($amount, $rate, $years, $frequency));
-                                }
-                            }),
+                            ->reactive(),
                         Forms\Components\Select::make('user_id')
                             ->relationship('user', 'name')
                             ->default(auth()->id())
@@ -82,68 +75,83 @@ class LoanResource extends Resource
                             ->native(false),
 
 
-                    ])->columns(6),
+                    ])->columns(6)
+                    ->reactive()
+                    ->afterStateUpdated(function (Forms\Get $get, Forms\Set $set) {
+                        if ($get('Amort_method') !== 'french') {
+                            return;
+                        }
+
+                        $amount = $get('amount');
+                        $rate = $get('rate_id');
+                        $years = $get('years');
+                        $frecuency = $get('frecuency_id');
+
+                        $payments = self::calculateFrenchAmortization($amount, $rate, $years, $frecuency);
+                        $set('payments', $payments);
+                    }),
 
                 TableRepeater::make('payments')
                     ->headers([
-                        Header::make('date')->width('150px')
-                            ->label('Fecha'),
-                        Header::make('pay')->width('150px')
-                            ->label('Pago'),
-                        Header::make('amort')->width('150px')
-                            ->label('Amortización'),
-                        Header::make('interest')->width('150px')
-                            ->label('Interés'),
-                        Header::make('balance')->width('150px')
-                            ->label('Balance'),
+                        Header::make('date')->width('150px'),
+                        Header::make('pay')->width('150px'),
+                        Header::make('amort')->width('150px'),
+                        Header::make('interest')->width('150px'),
+                        Header::make('balance')->width('150px'),
                     ])
                     ->schema([
                         Forms\Components\TextInput::make('date'),
-                        Forms\Components\TextInput::make('pay'),
-                        Forms\Components\TextInput::make('amort'),
-                        Forms\Components\TextInput::make('interest'),
-                        Forms\Components\TextInput::make('balance'),
+                        MoneyInput::make('pay')
+                            ->decimals(2),
+                        MoneyInput::make('amort')
+                            ->decimals(2),
+                        MoneyInput::make('interest')
+                            ->decimals(2),
+                        MoneyInput::make('balance')
+                            ->decimals(2),
                     ])
-
                     ->defaultItems(0)
                     ->reorderable()
                     ->cloneable()
                     ->collapsible()
                     ->minItems(3)
                     ->maxItems(5)
-                    ->columnSpan('full'),
+                    ->columnSpan('full')
+                    ->visible(fn(Forms\Get $get) => $get('Amort_method') === 'french')
+
+
             ]);
     }
-    private static function calculateFrenchAmortization($amount, $rate, $years, $frequency): array
+    private static function calculateFrenchAmortization($amount, $annualRate, $years, $frequency)
     {
-        $n = $years * $frequency; // Número total de pagos
-        $i = $rate; // Tasa de interés por período
-        $payment = $amount * ($i * pow(1 + $i, $n)) / (pow(1 + $i, $n) - 1); // Cuota fija
+        $totalPayments = $years * 12; // Total number of payments (monthly)
+        $monthlyRate = $annualRate / 12 / 100; // Convert annual rate to monthly decimal
+        $fixedAmortization = $amount / $totalPayments; // Fixed amortization per period
 
-        $schedule = [];
-        $balance = $amount;
+        $payments = []; // Initialize the array to hold payment details
+        $remainingBalance = $amount; // Start with the full loan amount
 
-        for ($t = 1; $t <= $n; $t++) {
-            $interest = $balance * $i;
-            $amortization = $payment - $interest;
-            $balance = $balance - $amortization;
+        for ($i = 1; $i <= $totalPayments; $i++) {
+            // Calculate interest for the current period
+            $interestForPeriod = $remainingBalance * $monthlyRate;
 
-            if ($t == $n) {
-                $amortization = $balance;
-                $payment = $amortization + $interest;
-                $balance = 0;
-            }
+            // Total payment for the current period
+            $totalPayment = $fixedAmortization + $interestForPeriod;
 
-            $schedule[] = [
-                'date' => now()->addMonths($t)->format('Y-m-d'),
-                'pay' => number_format($payment, 2, '.', ''),
-                'amort' => number_format($amortization, 2, '.', ''),
-                'interest' => number_format($interest, 2, '.', ''),
-                'balance' => number_format($balance, 2, '.', ''),
+            // Update remaining balance after payment
+            $remainingBalance -= $fixedAmortization;
+
+            // Store the payment details in the array
+            $payments[] = [
+                'date' => now()->addMonths($i)->format('Y-m-d'),
+                'pay' => number_format($totalPayment, 2),
+                'amort' => number_format($fixedAmortization, 2),
+                'interest' => number_format($interestForPeriod, 2),
+                'balance' => number_format($remainingBalance, 2),
             ];
         }
 
-        return $schedule;
+        return $payments; // Return the array of payment details
     }
     public static function table(Table $table): Table
     {
